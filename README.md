@@ -1,1 +1,1 @@
-# lofi
+# Localized Feature Importance (LOFI)
