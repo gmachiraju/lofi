@@ -2,3 +2,5 @@
 /src/outputs/*
 /models/cam/*
 /envs/envs/*
+/src/__pycache__/*
+/src/outputs_plip/*

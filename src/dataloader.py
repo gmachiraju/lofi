@@ -350,11 +350,12 @@ def reduce_Z(Z, kmeans_model):
     cluster_labs = kmeans_model.labels_
     zero_id = np.max(cluster_labs) + 1
     Z_viz = np.zeros((h, w, 1)) + zero_id
+
     # plot clusters for image
     for i in range(h):
         for j in range(w):
             Zij = Z[i,j,:]
-            if np.sum(Zij) > 0.0:
+            if np.sum(Zij) != 0.0:
                 Zij = Zij.reshape(1, -1)
                 cluster = kmeans_model.predict(Zij)
                 Z_viz[i,j,:] = cluster

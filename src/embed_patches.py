@@ -8,11 +8,16 @@ import pdb
 import matplotlib.pyplot as plt
 import seaborn as sns
 import cv2
+from PIL import Image
+import clip
 from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans, AgglomerativeClustering
 # import itertools
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mpl_toolkits.axes_grid1 import ImageGrid
+import matplotlib as mpl
+from matplotlib.colors import ListedColormap, LinearSegmentedColormap
+
 from skimage.filters import threshold_otsu
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
@@ -26,6 +31,7 @@ from sklearn.metrics import silhouette_score
 from sklearn.ensemble import GradientBoostingClassifier
 import scipy
 
+import gradcam_clip
 import utils
 from utils import serialize, deserialize
 from dataloader import EmbedDataset, reduce_Z
@@ -324,9 +330,106 @@ def construct_Z_efficient(X_id, Z_dim, files, hf, model, device, sample_size=20,
                 continue
 
     return Z, files_remaining, sample_z_dict
-       
 
-def construct_Zs_efficient(model, patch_dir, dim_dict, save_dir, device, scope="all", arm="train"):
+
+def inference_plip(X_id, Z_dim, files, hf, model, processor, tokenizer, device, sample_size=20, d=512, arm="train", text_to_encode=["normal lymph node", "lymph node metastasis"], bs=10):
+    num_files = len(files)
+
+    # grab triplets and do inference to get embeddings
+    with torch.no_grad():
+        x_locs_all = []
+        x_batch, x_locs = [], []
+        files_remaining = []
+
+        # initialize Z array
+        P = np.zeros((Z_dim[0]+1, Z_dim[1]+1, 1))
+        E = np.zeros((Z_dim[0]+1, Z_dim[1]+1, 1))
+        Z = np.zeros((Z_dim[0]+1, Z_dim[1]+1, d))
+        save_backup = False
+
+        # iterate through
+        for idx, f in enumerate(files):
+            im_id, i, j = parse_x_coords(f, arm)
+            if im_id != X_id:
+                if "noshift" in f:
+                    files_remaining.append(f)
+                continue
+            else: # match with X_id
+                # skipping 50shift for now to keep dimensionality low
+                if "noshift" in f: 
+                    # print("hit:", f)
+                    x = hf[f][()]
+                    # black background
+                    summed = np.sum(x, axis=0)
+                    if np.abs(np.mean(summed) - 0.0) < 100 and np.std(summed) < 10:
+                        # print("black bg tile!")
+                        continue 
+                    if np.abs(np.mean(summed) - 765) < 100 and np.std(summed) < 10:
+                        # print("white bg tile!")
+                        continue 
+                    x_locs.append((i,j))
+                    x_locs_all.append((i,j))
+                    x_batch.append(x)
+
+            # Need to check for any straggler patches at end that may not be a full batch
+            # Then we grab the first couple batch entries
+            if idx == num_files and len(x_batch) < bs: 
+                num_needed = bs - len(x_batch)
+                x_batch.extend([x_backup[i] for i in range(num_needed)])
+
+            if len(x_batch) == bs:
+                if save_backup == False:
+                    x_backup = x_batch.copy() # for any stragglers
+                    save_backup = True
+                x_batch = np.stack(x_batch, axis=0)
+                x_batch = torch.from_numpy(x_batch)
+                x_batch = x_batch.to(device=device, dtype=torch.float)
+
+                img_inputs = processor(images=x_batch, return_tensors="pt")
+                z_batch = model.get_image_features(**img_inputs)
+                
+                if arm == "test":
+                    inputs = processor(text=text_to_encode, images=x_batch, return_tensors="pt", padding=True)
+                    outputs = model(**inputs)
+                    
+                    #probabilities
+                    logits_per_image = outputs.logits_per_image  # this is the image-text similarity score
+                    probs = logits_per_image.softmax(dim=1) 
+
+                    # gradcam
+                    # text_input = clip.tokenize(["cancer"]).to(device)
+                    # text_input = processor(text=["cancer"], return_tensors="pt")
+                    # attn_map = gradcam_clip.gradCAM(model, img_inputs, model.get_text_features(text_input), getattr(model, "layer4"))
+                    # attn = attn_map.squeeze().detach().cpu().numpy()
+                    # print("Need to save attn and prob maps")
+                
+                for b,loc in enumerate(x_locs):
+                    i, j = loc[0], loc[1]
+                    # print(b,i,j)
+                    try:
+                        Z[i,j,:] = z_batch[b,:].cpu().detach().numpy()
+                        if arm == "test":
+                            P[i,j,:] = probs[b,1].cpu().detach().numpy() # class 1
+                            # E[i,j,:] = attn[b,:].cpu().detach().numpy()
+                    except IndexError:
+                        print(i, "or", j, "not in index range for Z:", Z.shape)
+                        continue
+                x_batch, x_locs = [], [] # reset
+
+        # grab sample size emebds from id list
+        sample_z_dict = {}
+        sample_locs = np.random.choice(len(x_locs_all), size=sample_size, replace=False)
+        sample_coords = [x_locs_all[sl] for sl in sample_locs]
+        for sc in sample_coords:
+            try:
+                sample_z_dict[X_id+"_"+str(sc[0])+"_"+str(sc[1])] = Z[sc[0],sc[1],:]
+            except IndexError:
+                continue
+
+    return Z, P, E, files_remaining, sample_z_dict 
+
+
+def construct_Zs_efficient(model, patch_dir, dim_dict, save_dir, device, scope="all", arm="train", modelstr="", processor=None, tokenizer=None, text_to_encode=["normal lymph node", "lymph node metastasis"], overwrite_flag=False):
     """
     Reads embeds dict, gathers by image ID, and then creates tensor; saves in a save_dir 
     """
@@ -342,35 +445,72 @@ def construct_Zs_efficient(model, patch_dir, dim_dict, save_dir, device, scope="
     files = list(hf.keys())
     print("We have", len(files), "unique patches to embed")
     model.eval()
-    sampled_embed_dict = {} # for sampling of embeds 
-    crop_dict = {}
+
+    if modelstr != "":
+        embed_path = arm + "_" + modelstr + "_sampled_inference_z_embeds.obj"
+        crop_path =  arm + "_" + modelstr + "_crop_coords.obj"
+    else:
+        embed_path = arm + "_sampled_inference_z_embeds.obj"
+        crop_path =  arm + "_crop_coords.obj"
+
+    if overwrite_flag == False:
+        try:
+            if arm == "train" and modelstr != "plip":
+                sampled_embed_dict = utils.deserialize(embed_path)
+            else:
+                sampled_embed_dict = {}
+            crop_dict = utils.deserialize(crop_path)
+            print("found embeds and crop coords!")
+        except FileNotFoundError:
+            sampled_embed_dict = {} # for sampling of embeds 
+            crop_dict = {}
+    else:
+        sampled_embed_dict = {} # for sampling of embeds 
+        crop_dict = {}
+
     # iterate and construct
     for idx, X_id in enumerate(scope):
+        print("On sample number", idx, "of", len(scope))
+        if os.path.exists(save_dir + "/Z-" + X_id + ".npy") and (X_id in crop_dict.keys()) and (overwrite_flag == False):
+            print("Already have {Z, embeds, and crop coordinates} for", X_id)
+            continue
+        
         Z_dim = dim_dict[X_id]
         print(Z_dim)
         if Z_dim[0] == 0 or Z_dim[1] == 0:
             continue
+
         print("On ID:", X_id)
-        Z, files, sample_z_dict = construct_Z_efficient(X_id, Z_dim, files, hf, model, device, arm=arm)
-        # if idx < 3:
-        #     plt.figure()
-        #     plt.imshow(np.sum(Z, axis=2), cmap="Dark2")
+        if modelstr == "":
+            Z, files, sample_z_dict = construct_Z_efficient(X_id, Z_dim, files, hf, model, device, arm=arm)
+        elif modelstr == "plip":
+            Z, P, E, files, sample_z_dict = inference_plip(X_id, Z_dim, files, hf, model, processor, tokenizer, device, arm=arm, text_to_encode=text_to_encode)
         Z, crop_coords = pad_Z(Z)
-        # if idx < 3:
-        # plt.figure()
-        # plt.imshow(np.sum(Z, axis=2), cmap="jet")
-        # plt.show()
 
         crop_dict[X_id] = crop_coords
         np.save(save_dir + "/Z-" + X_id + ".npy", Z)
-        for z in sample_z_dict.keys():
-            sampled_embed_dict[z] = sample_z_dict[z] # load
-        print("We now have", len(sampled_embed_dict.keys()), "embeddings stored as a sample")
-        print()
+        
+        if arm == "test" and modelstr == "plip":
+            save_root = save_dir.split("/")[:-1]
+            save_root = '/'.join(save_root)
+            np.save(save_root + "/probs_plip/P-" + X_id + ".npy", P)
+            # np.save(save_root + "/attn_plip/E-" + X_id + ".npy", E)
+        
+        if arm == "train" and modelstr != "plip":
+            for z in sample_z_dict.keys():
+                sampled_embed_dict[z] = sample_z_dict[z] # load
+            print("We now have", len(sampled_embed_dict.keys()), "embeddings stored as a sample")
+            print()
 
-    embed_path = arm + "_sampled_inference_z_embeds.obj"
-    utils.serialize(sampled_embed_dict, embed_path)
-    utils.serialize(crop_dict, arm + "_crop_coords.obj")
+        # in case of crash, we cache
+        if arm == "train" and modelstr != "plip":
+            utils.serialize(sampled_embed_dict, embed_path)
+        utils.serialize(crop_dict, crop_path)
+    
+    if arm == "train" and modelstr != "plip":
+        utils.serialize(sampled_embed_dict, embed_path)
+
+    utils.serialize(crop_dict, crop_path)
     print("serialized sampled numpy embeds at:", embed_path)
     print("saved Z tensors at:", save_dir)
     print("Done!")
@@ -545,9 +685,6 @@ def fit_clustering(embed_dict_path, K=20, alg="kmeans_euc", verbosity="full"):
 
             # ax1.scatter(X_embedded[:,0], X_embedded[:,1], c=cluster_labs, alpha=0.3, s=2, marker=ms, cmap="Dark2")
             
-
-
-
     unique, counts = np.unique(cluster_labs, return_counts=True)
     if verbosity == "full":
         plt.figure()
@@ -560,6 +697,7 @@ def fit_clustering(embed_dict_path, K=20, alg="kmeans_euc", verbosity="full"):
 def visualize_Z(Z_path, kmeans_model):
     Z = np.load(Z_path)
     Z_viz, zero_id = reduce_Z(Z, kmeans_model)
+    # pdb.set_trace()
     
     plt.figure(figsize=(12, 6), dpi=80)
     plt.yticks([])
@@ -729,8 +867,9 @@ def clean_Zs(Z_test_path, save_dir):
     Z_list = os.listdir(Z_test_path)
     plt.figure(figsize=(12,9))
     for idx, file in enumerate(Z_list):
+        # pdb.set_trace()
         Z = np.load(Z_test_path + "/" + file)
-        flatZ = np.sum(Z, axis=2) > 0
+        flatZ = np.sum(Z, axis=2) != 0.0
         plt.subplot(13,10,idx+1)
         plt.imshow(flatZ, cmap = "bone")
         plt.axis('off')
@@ -744,7 +883,7 @@ def clean_Zs(Z_test_path, save_dir):
         Z = clean_Z(Z, Z_id)
         np.save(save_dir + "/" + Z_id, Z)
         
-        flatZ = np.sum(Z, axis=2) > 0
+        flatZ = np.sum(Z, axis=2) != 0.0
         plt.subplot(13,10,idx+1)
         plt.imshow(flatZ, cmap = "bone")
         plt.axis('off')
@@ -1519,3 +1658,293 @@ def generate_model_outputs(Zs_path, kmeans_model, FI, mode, nbhd_size, crop_dict
     # run_test(gt_path, save_path, label_dict)
 
     return result_dict
+
+
+
+def run_lofi_gridsearch(modelstr, embed_path, device, Zs_path_train, Zs_path_test, label_dict_path_train, label_dict_path_test, crop_dict, csv_save_path, gts_path):
+    label_dict_train = utils.deserialize(label_dict_path_train)
+    label_dict_test = utils.deserialize(label_dict_path_test)
+
+    kmeans_filename = modelstr + "_kmeans_models_dict.obj"
+    try:
+        kmeans_models = utils.deserialize(kmeans_filename)
+    except:
+        kmeans_models = {}
+    print("K-means models cached (K):", list(kmeans_models.keys()))
+
+    tfidf_filename =  modelstr + "_tfidfs_dict.obj"
+    try:
+        tfidfs = utils.deserialize(tfidf_filename)
+    except:
+        tfidfs = {}
+    print("tf-idf models cached (K,r):", list(tfidfs.keys()))
+
+    elastic_filename = modelstr + "_elastic_dict.obj"
+    try:
+        elastic = utils.deserialize(elastic_filename)
+    except:
+        elastic = {}
+    print("elasticNet models cached (K,r):", list(elastic.keys()))
+
+    # big doodad -- dict of all model runs and stats
+    results_filename = modelstr + "_all_results_lofi.obj"
+    try:
+        all_results = utils.deserialize(results_filename)
+    except:
+        all_results = {}
+    print("all models cached so far:", list(all_results.keys()))
+    print("saving results to:", results_filename + "...")
+
+    # hyperparameter sweep
+    Ks = [10,15,20,25,30]
+    rs = [0,1,2,4,8]
+    alphas = [0.01, 0.025, 0.05, 1e10]
+    taus = [0,1,2]
+
+    num_models = (len(Ks) * len(rs) * len(alphas) * len(taus)) + (len(Ks) * len(rs))
+    print("Expecting", num_models, "for this grid_search... get strapped in")
+    model_counter = 0
+    hf = False
+
+    for K in Ks:
+        if K in kmeans_models.keys():
+            kmeans_model = kmeans_models[K]
+            print("Using existing k-means model")
+        else:
+            print("Fitting new k-means model...")
+            kmeans_model = fit_clustering(embed_path, K=K, alg="kmeans_euc", verbosity="none")
+            kmeans_models[K] = kmeans_model
+            serialize(kmeans_models, "kmeans_models_dict.obj")
+
+        for r in rs:
+            if r > 0:
+                m = "coclusterbag"
+            else:
+                m = "clusterbag"
+
+            # ElasticNet
+            #------------
+            if (K,r) in elastic.keys():
+                print("Using precomputed elasticNet! skipping run for (K,r):", K, r)
+                FI, roc_auc, prc_auc = elastic[(K,r)]
+            else:
+                print("Training elasticNet for (K,r):", K, r)
+                model = LogisticRegression(penalty='elasticnet', solver='saga', l1_ratio=0.5, random_state=0, max_iter=3000)
+                _, FI, y_probs, ys = train_on_Z(model, device, None, Zs_path_train, Zs_path_test, label_dict_path_train, label_dict_path_test, None, None, epochs=20, mode=m, kmeans_model=kmeans_models[K], nbhd_size=r)
+                roc_auc, prc_auc = eval_classifier(ys, y_probs) # test set clf stats
+                elastic[(K,r)] = [FI, roc_auc, prc_auc]
+                serialize(elastic, "elastic_dict.obj")
+
+            model_str = "K"+str(K)+"-r"+str(r)+"-elastic"
+            if model_str in all_results.keys():
+                print("Using cached model:", model_str)
+            else:
+                result_dict = generate_model_outputs(Zs_path_test, kmeans_models[K], FI, m, r, crop_dict, csv_save_path, gts_path, label_dict_test)
+                all_results[model_str] = result_dict
+                serialize(all_results, results_filename)
+            model_counter += 1
+
+            # DE
+            #-------
+            if (K,r) in tfidfs.keys():
+                print("Using precomputed tfidf! skipping run for (K,r):", K, r)
+                class0_tfidf, class1_tfidf, pvals = tfidfs[(K,r)]
+            else:
+                print("Calculating tfidf for (K,r):", K, r)
+                class0_tfidf, class1_tfidf, pvals = class_tfidf(Zs_path_train, label_dict_train, kmeans_models[K], K, r)
+                tfidfs[(K,r)] = [class0_tfidf, class1_tfidf, pvals]
+                serialize(tfidfs, "tfidfs_dict.obj")   
+            
+            for alpha in alphas:
+                for tau in taus:
+                    log2fc, neglog10p, colors = diff_exp(tfidfs, K, r, tau=tau, alpha=alpha)        
+                    significance_mask = [0 if c=="gray" else 1 for c in colors]
+                    FI = log2fc * np.array(significance_mask)
+
+                    model_str = "K"+str(K)+"-r"+str(r)+"-DEtok"+"-a"+str(alpha)+"-t"+str(tau)
+                    if model_str in all_results.keys():
+                        print("Using cached model:", model_str)
+                    else:
+                        result_dict = generate_model_outputs(Zs_path_test, kmeans_models[K], FI, m, r, crop_dict, csv_save_path, gts_path, label_dict_test)
+                        all_results[model_str] = result_dict
+                        serialize(all_results, results_filename)
+                    model_counter += 1   
+
+            print("We've completed/stored", model_counter, "models")
+            print("Another check for model count:", len(all_results.keys()))
+            print("Models so far:", list(all_results.keys()))
+
+
+def grab_stats(all_results, elastic):
+    search_plot_dict = {}
+
+    for model_str in all_results.keys():
+        pieces = model_str.split("-")
+        K, r, model_class = int(pieces[0].split("K")[1]), int(pieces[1].split("r")[1]), pieces[2]
+        alpha = None
+        tau = None
+        if len(pieces) > 3:
+            alpha = float(pieces[3].split("a")[1])
+            tau = int(pieces[4].split("t")[1])
+        key = (K,r,model_class,alpha,tau)
+        model_vals = all_results[model_str]
+
+        # classification
+        roc_auc, prc_auc = 0.0, 0.0 # non-elastic
+        if model_class == "elastic":
+            _, roc_auc, prc_auc = elastic[(K,r)]
+        roc_auc_fh, roc_auc_gs = model_vals["roc_auc_fh"], model_vals["roc_auc_gs"]
+        prc_auc_fh, prc_auc_gs = model_vals["prc_auc_fh"], model_vals["prc_auc_gs"]
+        max_auc_roc, max_auc_prc = np.max([roc_auc, roc_auc_fh, roc_auc_gs]), np.max([prc_auc, prc_auc_fh, prc_auc_gs]) 
+
+        # sod
+        acc_valid = model_vals["mean_max_accs_1_valid"]
+        acc_so = model_vals["mean_max_accs_1_so"]
+
+        vals = (max_auc_roc, max_auc_prc, acc_valid, acc_so)
+        search_plot_dict[key] = vals
+
+        # convert to df
+        df_rows = [list(key) + list(val) for key,val in search_plot_dict.items()]
+        cols = ["K", "r", "model_class", "a", "t", "auroc", "auprc", "acc_fg", "acc_so"]
+        results_df = pd.DataFrame.from_dict(df_rows, orient="columns")
+        results_df.columns = cols
+
+    return results_df
+
+
+def plot_gridsearch_encoder(detok_df, elastic_df):
+    fig, axs = plt.subplots(2, 2, figsize=(12,12))
+    fig.suptitle('Classification vs wsSOD Performance', fontsize=24)
+
+    SCALE = 15
+    c_detok = detok_df["K"]
+    s_detok = (np.array(detok_df["r"]) + 2) * SCALE
+    c_elastic = elastic_df["K"]
+    s_elastic = (np.array(elastic_df["r"]) + 2) * SCALE
+    ec="none"
+
+    axs[0,0].scatter(detok_df["auroc"], detok_df["acc_fg"], alpha=0.2, c=c_detok, edgecolors=ec, s=s_detok, marker="o")
+    axs[0,0].scatter(elastic_df["auroc"], elastic_df["acc_fg"], alpha=0.8, c=c_elastic, s=s_elastic, marker="x")
+    axs[0,0].set_xlabel('AUROC', fontsize=18)
+    axs[0,0].set_ylabel('Mean-max Accuracy (FG)', fontsize=18)
+
+    axs[0,1].scatter(detok_df["auprc"], detok_df["acc_fg"], alpha=0.2, c=c_detok, edgecolors=ec, s=s_detok, marker="o")
+    axs[0,1].scatter(elastic_df["auprc"], elastic_df["acc_fg"], alpha=0.8, c=c_elastic, s=s_elastic, marker="x")
+    axs[0,1].set_xlabel('AUPRC', fontsize=18)
+    # axs[0,1].set_ylabel('Mean-max Accuracy (FG)', fontsize=18)
+
+    axs[1,0].scatter(detok_df["auroc"], detok_df["acc_so"], alpha=0.2, c=c_detok, edgecolors=ec, s=s_detok, marker="o")
+    axs[1,0].scatter(elastic_df["auroc"], elastic_df["acc_so"], alpha=0.8, c=c_elastic, s=s_elastic, marker="x")
+    axs[1,0].set_xlabel('AUROC', fontsize=18)
+    axs[1,0].set_ylabel('Mean-max Accuracy (SO)', fontsize=18)
+
+    axs[1,1].scatter(detok_df["auprc"], detok_df["acc_so"], alpha=0.2, c=c_detok, edgecolors=ec, s=s_detok, marker="o")
+    axBR = axs[1,1].scatter(elastic_df["auprc"], elastic_df["acc_so"], alpha=0.8, c=c_elastic, s=s_elastic, marker="x")
+    axs[1,1].set_xlabel('AUPRC', fontsize=18)
+    # axs[1,1].set_ylabel('Mean-max Accuracy (SO)', fontsize=18)
+
+    fig.subplots_adjust(right=0.8)
+    cbar_ax = fig.add_axes([0.85, 0.15, 0.05, 0.7])
+    fig.colorbar(axBR, cax=cbar_ax)
+    plt.text(0.32,9.3,"K", {"fontsize":16})
+
+    handles, labels = axBR.legend_elements(prop="sizes", alpha=0.6, num=6)     
+    labels = ["0", "1", "2", "4", "8"]
+    legend = plt.legend(handles, labels, loc=(0,1.01), title="r")
+
+    plt.subplots_adjust(top=0.925)
+    plt.show()
+
+
+def is_pareto_efficient_dumb(costs):
+    """
+    Find the pareto-efficient points
+    :param costs: An (n_points, n_costs) array
+    :return: A (n_points, ) boolean array, indicating whether each point is Pareto efficient
+    """
+    is_efficient = np.ones(costs.shape[0], dtype = bool)
+    for i, c in enumerate(costs):
+        is_efficient[i] = np.all(np.any(costs[:i]>c, axis=1)) and np.all(np.any(costs[i+1:]>c, axis=1))
+    return is_efficient
+
+
+def get_top_models_encoder(results_df):
+    top_auroc = results_df.nlargest(3,"auroc")
+    top_auprc = results_df.nlargest(3,"auprc")
+    top_accso = results_df.nlargest(3,"acc_so")
+    top_accfg = results_df.nlargest(3,"acc_fg")
+    top_all = pd.concat([top_auroc, top_auprc, top_accso, top_accfg])
+    print("we have {} top models".format(len(top_all)))
+
+    numbers_all = results_df[["auroc","auprc","acc_fg","acc_so"]].values
+    iseff_all = is_pareto_efficient_dumb(numbers_all)
+    paretto_all = results_df[pd.Series(iseff_all).values]
+    print("we have {} paretto models".format(len(paretto_all)))
+
+    top_dict = {}
+    top_dict["top"] = top_all
+    top_dict["paretto"] = paretto_all
+    return top_dict
+
+
+def plot_top_explainers(top_model_dict_list, modelstr_list):
+    fig, axs = plt.subplots(2, 2, figsize=(12,12))
+    fig.suptitle('Classification vs wsSOD Performance', fontsize=24)
+    SCALE = 15
+    markers = {"plip":"o", "tile2vec":"x"}
+
+    for idx, top_model_dict in enumerate(top_model_dict_list):
+        modelstr = modelstr_list[idx]
+        marker = markers[modelstr]
+
+        top_df = top_model_dict["top"]
+        paretto_df = top_model_dict["paretto"]
+
+        c_top = top_df["K"]
+        s_top = (np.array(top_df["r"]) + 2) * SCALE
+        c_paretto = paretto_df["K"]
+        s_paretto = (np.array(paretto_df["r"]) + 2) * SCALE
+
+        if marker != "x":
+            ec = "k"
+            alpha = 0.4
+        else:
+            ec = None
+            alpha = 1
+        
+        viridis_big = mpl.colormaps['viridis']
+        cmap = ListedColormap(viridis_big(np.linspace(0, 0.85, 128)))
+        # cmap = "brg"
+
+        axs[0,0].scatter(top_df["auroc"], top_df["acc_fg"], alpha=alpha, c=c_top, edgecolors=ec, s=s_top, marker=marker, cmap=cmap)
+        axs[0,0].scatter(paretto_df["auroc"], paretto_df["acc_fg"], alpha=alpha, c=c_paretto, edgecolors=ec, s=s_paretto, marker=marker, cmap=cmap)
+        axs[0,0].set_xlabel('AUROC', fontsize=18)
+        axs[0,0].set_ylabel('Mean-max Accuracy (FG)', fontsize=18)
+
+        axs[0,1].scatter(top_df["auprc"], top_df["acc_fg"], alpha=alpha, c=c_top, edgecolors=ec, s=s_top, marker=marker, cmap=cmap)
+        axs[0,1].scatter(paretto_df["auprc"], paretto_df["acc_fg"], alpha=alpha, c=c_paretto, edgecolors=ec, s=s_paretto, marker=marker, cmap=cmap)
+        axs[0,1].set_xlabel('AUPRC', fontsize=18)
+        # axs[0,1].set_ylabel('Mean-max Accuracy (FG)', fontsize=18)
+
+        axs[1,0].scatter(top_df["auroc"], top_df["acc_so"], alpha=alpha, c=c_top, edgecolors=ec, s=s_top, marker=marker, cmap=cmap)
+        axs[1,0].scatter(paretto_df["auroc"], paretto_df["acc_so"], alpha=alpha, c=c_paretto, edgecolors=ec, s=s_paretto, marker=marker, cmap=cmap)
+        axs[1,0].set_xlabel('AUROC', fontsize=18)
+        axs[1,0].set_ylabel('Mean-max Accuracy (SO)', fontsize=18)
+
+        axBR = axs[1,1].scatter(top_df["auprc"], top_df["acc_so"], alpha=alpha, c=c_top, edgecolors=ec, s=s_top, marker=marker, cmap=cmap)
+        axs[1,1].scatter(paretto_df["auprc"], paretto_df["acc_so"], alpha=alpha, c=c_paretto, edgecolors=ec, s=s_paretto, marker=marker, cmap=cmap)
+        axs[1,1].set_xlabel('AUPRC', fontsize=18)
+        # axs[1,1].set_ylabel('Mean-max Accuracy (SO)', fontsize=18)
+
+    fig.subplots_adjust(right=0.8)
+    cbar_ax = fig.add_axes([0.85, 0.15, 0.05, 0.7])
+    fig.colorbar(axBR, cax=cbar_ax)
+    plt.text(0.32,9.3,"K", {"fontsize":16})
+
+    handles, labels = axBR.legend_elements(prop="sizes", alpha=0.6, num=6)     
+    labels = ["0", "1", "2", "4", "8"]
+    legend = plt.legend(handles, labels, loc=(0,1.01), title="r")
+    plt.subplots_adjust(top=0.925)
+
+    plt.show()

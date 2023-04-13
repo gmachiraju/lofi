@@ -594,7 +594,7 @@ def train_tandem(model_patch, device, optimizer, args, save_embeds_flag=True):
 
 
 
-def train_classifier(model, device, optimizer, args, save_embeds_flag=True):
+def train_classifier(model, device, optimizer, args, save_embeds_flag=False):
 	"""
 	Train a model on image data using the PyTorch Module API.
 
@@ -605,19 +605,26 @@ def train_classifier(model, device, optimizer, args, save_embeds_flag=True):
 
 	Returns: Nothing, but prints model accuracies during training.
 	"""
+
 	if save_embeds_flag == True:
 		if args.cache_path == None:
 			print("Error: Missing cache path for embeddings. Please enter a path to save your cache.")
 
 	# Logging with Weights & Biases
 	#-------------------------------
+	os.environ["WANDB_MODE"] = "online"
 	experiment = "PatchCNN-" + args.model_class + "-" + args.dataset_name
-	wandb.init(project=experiment, entity="gamified-learning")
+	wandb.init(project=experiment, entity="selfsup-longrange")	
 	wandb.config = {
 	  "learning_rate": LEARN_RATE,
 	  "epochs": args.num_epochs,
 	  "batch_size": args.batch_size
 	}
+
+	scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
+	print("hyperparams:\n" + "="*30)
+	print("Adam optimizer learn rate:", args.learn_rate)
+	print("Starting training procedure shortly...\n")
 
 	if args.model_to_load is None:
 		train_losses = []
@@ -672,11 +679,12 @@ def train_classifier(model, device, optimizer, args, save_embeds_flag=True):
 
 			train_losses.append(train_loss.item())
 			gc.collect()
+			scheduler.step()
 
-			embed_dict = store_embeds(embed_dict, fxy, x, model, args, att_flag)
-
+			if save_embeds_flag == True:
+				embed_dict = store_embeds(embed_dict, fxy, x, model, args, att_flag)
+				serialize(embed_dict, args.cache_path + "/" + args.string_details + "-curr_embeddings_train.obj")
 			# save embeddings every 4 epochs for standard classifiers
-			serialize(embed_dict, args.cache_path + "/" + args.string_details + "-curr_embeddings_train.obj")
 			if save_embeds_flag == True and ((e+1) % 4 == 0):
 				serialize(embed_dict, args.cache_path + "/" + args.string_details + "-epoch" + str(e) + "-embeddings_train.obj")
 				
@@ -692,10 +700,36 @@ def train_classifier(model, device, optimizer, args, save_embeds_flag=True):
 		# more logging
 		wandb.log({"end-of-epoch loss": train_loss})
 
+		# save model per epoch
+		print("saving model for epoch", e, "\n")
+		torch.save(model, args.model_path + "/" + args.string_details + "_epoch%s.pt" % e)
+		# serialize(train_losses, args.model_path + "/" + args.string_details + "_trainloss.obj")
+		# fig = plt.plot(train_losses, c="blue", label="train loss")
+		# plt.savefig(args.model_path + "/"  + args.string_details + "_trainloss.png", bbox_inches="tight")
+		torch.save({
+            'epoch': e,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': train_loss,
+            }, args.model_path + "/" + args.string_details + "_epoch%s.sd" % e)
+		torch.save({
+            'epoch': e,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': train_loss,
+            }, args.model_path + "/" + args.string_details + ".sd")
+		# always keep a backup
+		torch.save({
+            'epoch': e,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': train_loss,
+            }, args.model_path + "/BACKUP-" + args.string_details + ".sd")
+
 	# full model save
 	torch.save(model, args.model_path + "/" + args.string_details + "_full.pt")
-
 	return train_losses
+
 
 # adapted from tile2vec
 def prep_triplets(triplets, cuda, triplet_type="dict", dtype=torch.float, rescale=True):
