@@ -4,3 +4,7 @@
 /envs/envs/*
 /src/__pycache__/*
 /src/outputs_plip/*
+wandb/
+
+**.ipynb_checkpoints/
+**.egg-info*
