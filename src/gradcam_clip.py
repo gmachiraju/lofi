@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from scipy.ndimage import filters
 from torch import nn
+import pdb
+# https://github.com/kevinzakka/clip_playground/blob/main/CLIP_GradCAM_Visualization.ipynb
 
 def normalize(x: np.ndarray) -> np.ndarray:
     # Normalize to [0, 1].
@@ -40,8 +42,6 @@ def load_image(img_path, resize=None):
     return np.asarray(image).astype(np.float32) / 255.
 
 
-
-
 class Hook:
     """Attaches to a module and records its activations and gradients."""
 
@@ -68,8 +68,6 @@ class Hook:
     def gradient(self) -> torch.Tensor:
         return self.data.grad
 
-
-# Reference: https://arxiv.org/abs/1610.02391
 def gradCAM(
     model: nn.Module,
     input: torch.Tensor,
@@ -105,6 +103,56 @@ def gradCAM(
         # We only want neurons with positive influence so we
         # clamp any negative ones.
         gradcam = torch.clamp(gradcam, min=0)
+
+    # Resize gradcam to input resolution.
+    gradcam = F.interpolate(
+        gradcam,
+        input.shape[2:],
+        mode='bicubic',
+        align_corners=False)
+    
+    # Restore gradient settings.
+    for name, param in model.named_parameters():
+        param.requires_grad_(requires_grad[name])
+        
+    return gradcam
+    
+# Reference: https://arxiv.org/abs/1610.02391
+def gradCAM1(model: nn.Module, input: torch.Tensor, target: torch.Tensor, inputs, layer: nn.Module) -> torch.Tensor:
+    # Zero out any gradients at the input.
+    if input["pixel_values"].grad is not None:
+        input["pixel_values"].grad.data.zero_()
+    print("A")
+        
+    # Disable gradient settings.
+    requires_grad = {}
+    for name, param in model.named_parameters():
+        requires_grad[name] = param.requires_grad
+        param.requires_grad_(False)
+    print("B")
+        
+    # Attach a hook to the model at the desired layer.
+    assert isinstance(layer, nn.Module)
+    with Hook(layer) as hook:        
+        # Do a forward and backward pass.
+        output = model(**inputs)
+        print("hey")
+        pdb.set_trace()
+        output.backward(target)
+        print("hey2")
+        grad = hook.gradient.float()
+        act = hook.activation.float()
+    
+        # Global average pool gradient across spatial dimension
+        # to obtain importance weights.
+        alpha = grad.mean(dim=(2, 3), keepdim=True)
+        # Weighted combination of activation maps over channel
+        # dimension.
+        gradcam = torch.sum(act * alpha, dim=1, keepdim=True)
+        # We only want neurons with positive influence so we
+        # clamp any negative ones.
+        gradcam = torch.clamp(gradcam, min=0)
+    print("C")
 
     # Resize gradcam to input resolution.
     gradcam = F.interpolate(

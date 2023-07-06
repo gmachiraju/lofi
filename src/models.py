@@ -314,9 +314,15 @@ class ResNet(nn.Module):
             x = F.avg_pool2d(x, 5)
         elif self.tile_size == 100:
             x = F.avg_pool2d(x, 7)
+        elif self.tile_size == 160: 
+            # added this for larger inputs
+            x = F.avg_pool2d(x, 10)
         elif self.tile_size == 224: 
             # added this for larger inputs
             x = F.avg_pool2d(x, 14)
+        elif self.tile_size == 320: 
+            # added this for larger inputs
+            x = F.avg_pool2d(x, 16)
 
         if verbose: print('Pooling:', x.shape)
         z = x.view(x.size(0), -1)

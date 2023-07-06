@@ -28,16 +28,18 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 import torchvision
 import torchvision.models
 from torchvision import transforms as trn
+from vit_pytorch import ViT
 
 import wandb
 
 # personal imports
-from dataloader import DataLoaderCustom, create_triplet_dataloader
+from dataloader import DataLoaderCustom, create_triplet_dataloader, DataLoaderSTS
 import utils
 from utils import labels_dict, count_files, unique_files, set_splits
 from utils import train_dir, val_dir, test_dir
 from utils import serialize, deserialize, str2bool
 from models import ResNet18, VGG19, VGGEmbedder, AttnVGG_before, vgg19, vgg19_bn, MultiTaskLoss, ElasticLinear
+
 
 
 # Constants/defaults
@@ -411,8 +413,8 @@ def train_tandem(model_patch, device, optimizer, args, save_embeds_flag=True):
 
 	elif args.model_class == "ViT":
 		 # embedder = ViTEmbedder()
-		 print("ViT embedder not yet fully implemented")
-		 exit()
+		print("ViT embedder not yet fully implemented")
+		exit()
 	
 	embedder = embedder.to(device=device) 
 
@@ -422,10 +424,11 @@ def train_tandem(model_patch, device, optimizer, args, save_embeds_flag=True):
 	else: # register hooks instead
 		activation = {}
 		def getActivation(name):
-		  # the hook signature
-		  def hook(model, input, output):
-		    activation[name] = output.detach()
-		  return hook
+		  	# the hook signature
+			def hook(model, input, output):
+				activation[name] = output.detach()
+				return hook
+		
 		h_linear = embedder.embedder.classifier[0].register_forward_hook(getActivation('linear'))
 		z = embedder(x.float()) # forward pass
 		h_linear.remove()
@@ -593,7 +596,6 @@ def train_tandem(model_patch, device, optimizer, args, save_embeds_flag=True):
 
 
 
-
 def train_classifier(model, device, optimizer, args, save_embeds_flag=False):
 	"""
 	Train a model on image data using the PyTorch Module API.
@@ -612,7 +614,7 @@ def train_classifier(model, device, optimizer, args, save_embeds_flag=False):
 
 	# Logging with Weights & Biases
 	#-------------------------------
-	os.environ["WANDB_MODE"] = "online"
+	os.environ["WANDB_MODE"] = "offline"
 	experiment = "PatchCNN-" + args.model_class + "-" + args.dataset_name
 	wandb.init(project=experiment, entity="selfsup-longrange")	
 	wandb.config = {
@@ -647,7 +649,7 @@ def train_classifier(model, device, optimizer, args, save_embeds_flag=False):
 	model.train()
 
 	# files loaded differently per model class
-	for e in range(0 + args.prev_epoch, args.num_epochs + args.prev_epoch):
+	for e in range(1 + args.prev_epoch, 1 + args.num_epochs + args.prev_epoch):
 		print("="*30 + "\n", "Beginning epoch", e, "\n" + "="*30)
 	
 		if save_embeds_flag == True:
@@ -662,6 +664,8 @@ def train_classifier(model, device, optimizer, args, save_embeds_flag=False):
 			if args.model_class == "VGG_att":
 				[scores, c1, c2, c3] = model(x)
 			elif args.model_class in ["VGG19", "VGG19_bn"]:
+				scores = model(x)
+			elif args.model_class == "ViT":
 				scores = model(x)
 
 			train_loss = F.cross_entropy(scores, y)
@@ -689,23 +693,17 @@ def train_classifier(model, device, optimizer, args, save_embeds_flag=False):
 				serialize(embed_dict, args.cache_path + "/" + args.string_details + "-epoch" + str(e) + "-embeddings_train.obj")
 				
 		# save model per epoch
+		print("saving model for epoch", e, "\n")
 		torch.save(model, args.model_path + "/" + args.string_details + "_epoch%s.pt" % e)
-		# Future: check val acc every epoch
 
 		# cache the losses every epoch
 		serialize(train_losses, args.model_path + "/" + args.string_details + "_trainloss.obj")
-		fig = plt.plot(train_losses, c="blue", label="train loss")
-		plt.savefig(args.model_path + "/"  + args.string_details + "_trainloss.png", bbox_inches="tight")
-
+		# fig = plt.plot(train_losses, c="blue", label="train loss")
+		# plt.savefig(args.model_path + "/"  + args.string_details + "_trainloss.png", bbox_inches="tight")
+# 
 		# more logging
 		wandb.log({"end-of-epoch loss": train_loss})
 
-		# save model per epoch
-		print("saving model for epoch", e, "\n")
-		torch.save(model, args.model_path + "/" + args.string_details + "_epoch%s.pt" % e)
-		# serialize(train_losses, args.model_path + "/" + args.string_details + "_trainloss.obj")
-		# fig = plt.plot(train_losses, c="blue", label="train loss")
-		# plt.savefig(args.model_path + "/"  + args.string_details + "_trainloss.png", bbox_inches="tight")
 		torch.save({
             'epoch': e,
             'model_state_dict': model.state_dict(),
@@ -718,13 +716,6 @@ def train_classifier(model, device, optimizer, args, save_embeds_flag=False):
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': train_loss,
             }, args.model_path + "/" + args.string_details + ".sd")
-		# always keep a backup
-		torch.save({
-            'epoch': e,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': train_loss,
-            }, args.model_path + "/BACKUP-" + args.string_details + ".sd")
 
 	# full model save
 	torch.save(model, args.model_path + "/" + args.string_details + "_full.pt")
@@ -1075,13 +1066,127 @@ def train_carta(model, device, optimizer, args, margin=10, l2=0.01, print_every=
 	return (avg_loss, avg_l_n, avg_l_d, avg_l_nd)
 
 
+
+def train_STSclassifier(model, device, optimizer, args):
+	"""
+	Train a model on image data using the PyTorch Module API.
+
+	Inputs:
+	- model: A PyTorch Module giving the model to train.
+	- optimizer: An Optimizer object we will use to train the model
+	- epochs: (Optional) A Python integer giving the number of epochs to train for
+
+	Returns: Nothing, but prints model accuracies during training.
+	"""
+
+	# Logging with Weights & Biases
+	#-------------------------------
+	os.environ["WANDB_MODE"] = "offline"
+	experiment = "PatchCNN-" + args.model_class + "-" + args.dataset_name
+	wandb.init(project=experiment, entity="selfsup-longrange")	
+	wandb.config = {
+	  "learning_rate": LEARN_RATE,
+	  "epochs": args.num_epochs,
+	  "batch_size": args.batch_size
+	}
+
+	scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.9)
+	print("hyperparams:\n" + "="*30)
+	print("Adam optimizer learn rate:", args.learn_rate)
+	print("Starting training procedure shortly...\n")
+
+	if args.model_to_load is None:
+		train_losses = []
+	else:
+		train_losses = utils.deserialize(args.model_path + "/" + args.string_details + "_trainloss.obj") # same as train loss
+	model = model.to(device=device)
+	summary(model, input_size=(args.channel_dim, args.patch_size, args.patch_size)) # print model
+
+	dr = args.data_path
+	c0l = args.trip0_path
+	c1l = args.trip0_path
+	ldp = args.labeldict_path
+	cs = args.patch_size
+	if cs is not None:
+		cf = True
+	train_loader = DataLoaderSTS(args, data_root=dr, class0_list=c0l, class1_list=c1l, label_dict_path=ldp, chunk_size=cs, chunking_flag=cf)
+	model.train()
+
+	# files loaded differently per model class
+	for e in range(1 + args.prev_epoch, 1 + args.num_epochs + args.prev_epoch):
+		print("="*30 + "\n", "Beginning epoch", e, "\n" + "="*30)
+	
+		for t, (fxy, x, y) in enumerate(train_loader):
+			if cs == 160:
+				print("please add loop to handle extra computation")
+				exit()
+			x = torch.from_numpy(x)
+			y = torch.from_numpy(y)
+			x = x.to(device=device, dtype=dtype)  # move to device, e.g. GPU
+			y = y.to(device=device, dtype=torch.long)
+
+			if args.model_class == "VGG_att":
+				[scores, c1, c2, c3] = model(x)
+			elif args.model_class in ["VGG19", "VGG19_bn", "ViT", "ResNet18"]:
+				scores = model(x)
+
+			if args.patch_loss == "bce":
+				train_loss = F.cross_entropy(scores, y)
+			else:
+				print("loss unsuported. please reconsider.")
+				exit()
+
+			optimizer.zero_grad()
+			train_loss.backward()
+			optimizer.step()
+
+			if t % print_every == 0:
+				print('Iteration %d, train loss = %.4f' % (t + print_every, train_loss.item()))
+				preds, probs, num_correct, num_samples = check_mb_accuracy(scores, y)
+				acc = float(num_correct) / num_samples
+				print('minibatch training accuracy: %.4f' % (acc * 100))
+				# more logging
+				wandb.log({"loss": train_loss})
+
+			train_losses.append(train_loss.item())
+			gc.collect()
+			scheduler.step()
+
+		# save model per epoch
+		print("saving model for epoch", e, "\n")
+		torch.save(model, args.model_path + "/" + args.string_details + "_epoch%s.pt" % e)
+		# cache the losses every epoch
+		serialize(train_losses, args.model_path + "/" + args.string_details + "_trainloss.obj")
+
+		# more logging
+		wandb.log({"end-of-epoch loss": train_loss})
+
+		torch.save({
+            'epoch': e,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': train_loss,
+            }, args.model_path + "/" + args.string_details + "_epoch%s.sd" % e)
+		torch.save({
+            'epoch': e,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': train_loss,
+            }, args.model_path + "/" + args.string_details + ".sd")
+
+	# full model save
+	torch.save(model, args.model_path + "/" + args.string_details + "_full.pt")
+	return train_losses
+
+
+
 def main():
 
 	# ARGPARSE
 	#==========
 	parser = argparse.ArgumentParser()
 	parser.add_argument('--description', default="no-description", type=str, help='Description of your experiement, with no spaces. E.g. VGG19_bn-random_loading-label_inherit-bce_loss-on_MFL-1')
-	parser.add_argument('--model_class', default=None, type=str, help='Select one of: VGG19/VGG19_bn/VGG_att.')
+	parser.add_argument('--model_class', default=None, type=str, help='Select one of: VGG19/VGG19_bn/VGG_att/ViT.')
 	parser.add_argument('--num_epochs', default=10, type=int, help='Number of epochs to train for. Default is 10.')
 	parser.add_argument('--hyperparameters', default=0.01, type=float, help="Denotes hyperparameters for custom multi-task losses. Default value is alpha=0.01, where a higer value indicates more focus on img-level predictions")
 	parser.add_argument('--batch_size', default=36, type=int, help="Batch size. dDfault is 36.")
@@ -1195,31 +1300,49 @@ def main():
 	
 	# MODEL INSTANTIATION 
 	#=====================
-	if args.model_to_load == None or args.model_to_load.endswith(".sd"):
+	if args.model_class == "ViT":
+			# model = torchvision.models.vit_b_16()
+			model = ViT(
+				image_size = 224,
+				patch_size = 16,
+				num_classes = num_classes,
+				dim = 1024,
+				depth = 6,
+				heads = 16,
+				mlp_dim = 2048,
+				dropout = 0.1,
+				emb_dropout = 0.1
+			)
+	elif args.model_class.startswith("VGG"):
+		if args.model_class == "VGG19":
+			if args.patch_size == 96:
+				model = VGG19(bn_flag=False).arch
+			elif args.patch_size == 224:
+				model = vgg19(pretrained=False)
+		elif args.model_class == "VGG19_bn":
+			if args.patch_size == 96:
+				model = VGG19(bn_flag=True).arch
+			elif args.patch_size == 224:
+				model = vgg19_bn(pretrained=False, in_channels=args.channel_dim)
+				# model = torchvision.models.vgg19_bn(weights=None) 
+		elif args.model_class == "VGG_att":
+			model = AttnVGG_before(args.channel_dim, args.patch_size, num_classes)
+
+	elif args.model_class.startswith("ResNet18") and args.selfsup_flag == True:
+		# model = ResSelfEmbedder(num_blocks=[2,2,2,2,2], in_channels=3, z_dim=512)
+		model = ResNet18(n_classes=2, in_channels=3, z_dim=128, supervised=False, no_relu=False, loss_type='triplet', tile_size=224, activation='relu')
+		# z_dim used to be 512
+	
+	elif args.model_class.startswith("ResNet18") and args.selfsup_flag == False:
+		print("WSL on ResNet18 chosen")
+		model = ResNet18(n_classes=2, in_channels=3, z_dim=128, supervised=True, no_relu=False, loss_type='bce', tile_size=args.patch_size, activation='relu')
+
+
+	# check for simple torch loads
+	if args.model_to_load == None:
 		prev_epoch = 0 # no previous training
 		print("Starting a fresh model to train!")
-		if args.model_class == "ViT":
-			model = torchvision.models.vit_b_16()
-		elif args.model_class.startswith("VGG"):
-			if args.model_class == "VGG19":
-				if args.patch_size == 96:
-					model = VGG19(bn_flag=False).arch
-				elif args.patch_size == 224:
-					model = vgg19(pretrained=False)
-			elif args.model_class == "VGG19_bn":
-				if args.patch_size == 96:
-					model = VGG19(bn_flag=True).arch
-				elif args.patch_size == 224:
-					model = vgg19_bn(pretrained=False, in_channels=args.channel_dim)
-					# model = torchvision.models.vgg19_bn(weights=None) 
-			elif args.model_class == "VGG_att":
-				model = AttnVGG_before(args.channel_dim, args.patch_size, num_classes)
-
-		elif args.model_class.startswith("ResNet18") and args.selfsup_flag == True:
-			# model = ResSelfEmbedder(num_blocks=[2,2,2,2,2], in_channels=3, z_dim=512)
-			model = ResNet18(n_classes=2, in_channels=3, z_dim=128, supervised=False, no_relu=False, loss_type='triplet', tile_size=224, activation='relu')
-			# z_dim used to be 512
-	else:
+	elif isinstance(args.model_to_load, str) and not args.model_to_load.endswith(".sd"):
 		print("Detected a previously trained model to continue training on! Initiating warm start from torch load...")
 		model = torch.load(args.model_to_load, map_location=device)
 		prev_epoch_temp = args.model_to_load.split("epoch")[1]
@@ -1229,7 +1352,9 @@ def main():
 	# OPTIMIZER INSTANTIATION
 	#=========================
 	if args.patch_labeling == "inherit" or args.patch_labeling == "seg":
-		optimizer = optim.Adam(model.parameters(), lr=LEARN_RATE)
+		lr = 5e-4 #5e-4 # LEARN_RATE # 5e-4, now slowing
+		setattr(args, "learn_rate", lr)
+		optimizer = optim.Adam(model.parameters(), lr=args.learn_rate)
 	elif args.patch_labeling == "proxy":
 		optimizer = optim.RMSprop(model.parameters(), lr=LEARN_RATE) #or GD -- only for future models
 	elif args.patch_labeling == "selfsup":
@@ -1281,7 +1406,10 @@ def main():
 		exit()
 
 	if args.gamified_flag == False:
-		loss_history = train_classifier(model, device, optimizer, args) 
+		if args.dataset_name == "sts":
+			loss_history = train_STSclassifier(model, device, optimizer, args)
+		else:
+			loss_history = train_classifier(model, device, optimizer, args) 
 	elif args.gamified_flag == True: 
 		print("="*60 + "\nInitiating backbone architecture for Gamified Learning!" + "\n" + "="*60)
 		if args.pool_type != "max":

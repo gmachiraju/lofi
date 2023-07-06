@@ -1,6 +1,12 @@
 /src/extra_code/*
 /src/outputs/*
 /models/cam/*
+/models/*
 /envs/envs/*
 /src/__pycache__/*
 /src/outputs_plip/*
+/src/outputs_clip/*
+/src/outputs_tile2vec/*
+/src/outputs_vit_iid/*
+/src/run_scripts/wandb/*
+/src/faulty/*

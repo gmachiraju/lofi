@@ -8,11 +8,15 @@ import h5py
 from pathlib import Path
 import pdb
 import itertools
+from PIL import Image
+from itertools import product
+from mpl_toolkits.axes_grid1 import ImageGrid
 
 from sklearn.preprocessing import KBinsDiscretizer
 from torchvision.io import read_image
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+import matplotlib.pyplot as plt
 
 import utils
 from preprocess import axis_rotate, axis_reflect, normalize
@@ -46,6 +50,154 @@ class LabelDiscretizer(object):
         enc = KBinsDiscretizer(n_bins=3, encode='ordinal')
         dat_binner = enc.fit(np.expand_dims(np.array(meds), axis=1))
         return dat_binner
+
+def tile(img, d):
+    """
+    img = PIL image
+    """
+    patches = []
+    boxes = []
+    w, h = img.size
+    grid = product(range(0, h-h%d, d), range(0, w-w%d, d))
+    for i, j in grid:
+        box = (j, i, j+d, i+d)
+        patches.append(np.array(img.crop(box)))
+        boxes.append(box)
+    return patches, w // d, h // d, boxes
+
+class DataLoaderSTS(object):
+    """
+    This dataloader can work on-the-fly (otf) or using pre-stored patches (stored)
+    """
+    def __init__(self, args, data_root, class0_list, class1_list, label_dict_path, chunk_size=320, chunking_flag=True):        
+        self.args = args
+        self.data_root = data_root
+        self.chunk_size = chunk_size
+        if chunk_size not in [160, 320]:
+            print("selected chunk size not supported:", chunk_size)
+            exit()
+        self.chunking_flag = chunking_flag
+        self.label_dict = utils.deserialize(label_dict_path)
+        if chunking_flag == True:
+            self.batch_size = 2
+            self.rescale_size = None
+        else:
+            self.batch_size = 24
+            self.rescale_size = (320,320) # make same architecture as chunking model above
+        
+        self.class0_files = utils.deserialize(class0_list)
+        self.class1_files = utils.deserialize(class1_list)
+        self.class0_files_withaug = [(el,None) for el in self.class0_files]
+        self.class1_files_withaug = [(el,None) for el in self.class1_files] + [(el,"refl") for el in self.class1_files]
+
+        # all_files = []
+        # for file in os.listdir(data_root):
+        #     intermed_path = data_root + file
+        #     if os.path.isdir(intermed_path):
+        #         files = os.listdir(intermed_path)
+        #         all_files.extend([intermed_path + "/" + f for f in files])       
+        all_files = self.class0_files_withaug + self.class1_files_withaug
+        
+        self.files = all_files
+        self.num_files = len(self.files)
+        self.num_files_aug0 = len(self.class0_files_withaug)
+        self.num_files_aug1 = len(self.class1_files_withaug)
+
+        np.random.seed(231)
+        random.shuffle(self.files)
+        random.shuffle(self.class0_files_withaug)
+        random.shuffle(self.class1_files_withaug)
+
+    def process_patches(self, f, aug):
+        patches_processed = []
+        img = Image.open(f)
+        patches, _, _, boxes = tile(img, self.chunk_size)
+        # coords_proto = ["-".join(str(box).split(",")) for box in boxes]
+        # coords = [c.replace(" ", "") for c in coords_proto]
+        coords = [box for box in boxes] # copy
+        filenames = [(f, coord) for coord in coords]
+        for pat in patches:
+            pat = normalize(pat, "sts")
+            if aug == "refl":
+                pat = axis_reflect(pat, 1)
+            h,w,d = pat.shape
+            pat = np.reshape(pat, (d,h,w))
+            patches_processed.append(pat)
+        return patches_processed, filenames
+    
+    def process_image(self, f, aug):
+        img = Image.open(f)
+        img = img.resize(self.rescale_size)
+        img = np.array(img)
+        img = normalize(img, "sts")
+        if aug == "refl":
+            img = axis_reflect(img, 1)
+        h,w,d = img.shape
+        img = np.reshape(img, (d,h,w))
+        return img
+
+    def __iter__(self):
+        """
+        Custom generator to retrieve batches
+        """
+        if self.chunking_flag == True:
+            i = 0
+            while i < len(self.files):
+                # get class 0
+                for (f,aug) in self.class0_files_withaug[i:i+self.batch_size//2]:
+                    patches_processed0, filenames0 = self.process_patches(f,aug)
+                    labels0 = [0 for _ in range(len(patches_processed0))]
+                # get class 1
+                for (f,aug) in self.class1_files_withaug[i:i+self.batch_size//2]:
+                    patches_processed1, filenames1 = self.process_patches(f,aug)
+                    labels1 = [1 for _ in range(len(patches_processed1))]
+
+                batch = patches_processed0 + patches_processed1
+                labels = labels0 + labels1
+                filenames = filenames0 + filenames1
+
+                # shuffle
+                ids = list(range(len(batch)))
+                random.shuffle(ids)
+                batch = [batch[i] for i in ids]
+                labels = [labels[i] for i in ids]
+                filenames = [filenames[i] for i in ids]
+     
+                batch = np.stack(batch, axis=0)
+                labels = np.array(labels)
+                yield (filenames, batch, labels)
+                i += self.batch_size  
+        else:    
+            i = 0
+            while i < len(self.files):
+                batch = []
+                labels = []
+                filenames = []
+
+                # class 0
+                for (f,aug) in self.class0_files_withaug[i:i+self.batch_size//2]:
+                    img = self.process_image(f, aug)
+                    batch.append(img)
+                    labels.append(0)
+                    filenames.append(f)
+                # class 1
+                for (f,aug) in self.class1_files_withaug[i:i+self.batch_size//2]:
+                    img = self.process_image(f, aug)
+                    batch.append(img)
+                    labels.append(1)
+                    filenames.append(f)
+
+                # shuffle
+                ids = list(range(len(batch)))
+                random.shuffle(ids)
+                batch = [batch[i] for i in ids]
+                labels = [labels[i] for i in ids]
+                filenames = [filenames[i] for i in ids]
+     
+                batch = np.stack(batch, axis=0)
+                labels = np.array(labels)
+                yield (filenames, batch, labels)
+                i += self.batch_size  
 
 
 class DataLoaderCustom(object):
@@ -344,9 +496,8 @@ def create_triplet_dataloader(args, patch_dir, triplet_names, shuffle=True, num_
     return dataloader
 
 
-def reduce_Z(Z, kmeans_model):
+def reduce_Z(Z, kmeans_model, mode="dict"):
     h,w,d = Z.shape
-    # print("Z shape:", h,w,d)
     cluster_labs = kmeans_model.labels_
     zero_id = np.max(cluster_labs) + 1
     Z_viz = np.zeros((h, w, 1)) + zero_id
@@ -356,8 +507,13 @@ def reduce_Z(Z, kmeans_model):
         for j in range(w):
             Zij = Z[i,j,:]
             if np.sum(Zij) != 0.0:
-                Zij = Zij.reshape(1, -1)
-                cluster = kmeans_model.predict(Zij)
+                if mode == "dict":
+                    Zij = Zij.reshape(1, -1)
+                    cluster = kmeans_model.predict(Zij)
+                elif mode == "memmap":
+                    Zij = Zij.reshape(1, -1).astype('double')
+                    Zij = np.array(Zij, copy=True).astype('double')
+                    cluster = kmeans_model.predict(Zij)
                 Z_viz[i,j,:] = cluster
     return Z_viz, zero_id   
 

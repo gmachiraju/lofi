@@ -399,6 +399,13 @@ def normalize(im, dataset_name, transform_fn=None, normalize_fn=None):
         im = im.cpu().detach().numpy()
         new_im = im.reshape(channel, imgwidth, imgheight)
 
+    elif dataset_name == "sts":
+        # print("normalization")
+        channel_means = [0.62263762, 0.57118355, 0.4726399]
+        channel_std = [0.35843889, 0.34179003, 0.32135169]
+        im = np.array(im)
+        im = im.astype(float) / 255.
+        new_im = (im - channel_means) / channel_std
     else:
         new_im = im
 
