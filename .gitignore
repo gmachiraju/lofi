@@ -10,3 +10,6 @@
 /src/outputs_vit_iid/*
 /src/run_scripts/wandb/*
 /src/faulty/*
+/wandb/
+**.ipynb_checkpoints/
+**.egg-info*
